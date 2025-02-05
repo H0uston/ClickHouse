@@ -224,8 +224,8 @@ class GitHub(github.Github):
             "query": action,
             "variables": {"input": {"pullRequestId": node_id}},
         }
-        url = f"{pr._requester.base_url}/graphql"
-        _, data = pr._requester.requestJsonAndCheck("POST", url, input=query)
+        url = f"{pr.requester.base_url}/graphql"
+        _, data = pr.requester.requestJsonAndCheck("POST", url, input=query)
         if data.get("data"):
             pr._draft = pr._makeBoolAttribute(not pr.draft)
 

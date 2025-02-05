@@ -45,7 +45,7 @@ def repo_merge_upstream(repo: Repository, branch: str) -> None:
     """A temporary hack to implement the following patch in out code base:
     https://github.com/PyGithub/PyGithub/pull/3175"""
     post_parameters = {"branch": branch}
-    repo._requester.requestJsonAndCheck(  # pylint:disable=protected-access
+    repo.requester.requestJsonAndCheck(
         "POST", f"{repo.url}/merge-upstream", input=post_parameters
     )
 
