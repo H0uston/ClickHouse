@@ -38,4 +38,4 @@ jobs:
       - name: Update official docker repos
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 official_docker_update.py --debug-helpers $DRY_RUN
+          python3 official_docker_update.py -vv $DRY_RUN
