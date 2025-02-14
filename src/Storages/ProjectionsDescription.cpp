@@ -1,3 +1,4 @@
+#include <memory>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/TreeRewriter.h>
 #include <Storages/ProjectionsDescription.h>
@@ -24,9 +25,10 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <base/range.h>
 #include <Core/Settings.h>
-#include "Analyzer/AggregationUtils.h"
-#include "Analyzer/QueryNode.h"
 #include "Interpreters/InterpreterSelectQueryAnalyzer.h"
+#include <Interpreters/StorageID.h>
+#include "Storages/ColumnsDescription.h"
+#include "Storages/StorageValues.h"
 
 
 namespace DB
@@ -138,19 +140,17 @@ ProjectionDescription ProjectionDescription::getProjectionFromAST(
         result.required_columns = interpreter.getRequiredColumns();
         result.sample_block = interpreter.getSampleBlock();
 
-        const auto & query_tree = interpreter.getQueryTree();
-        const auto * query_node = query_tree->as<QueryNode>();
-
-        // TODO: Reuse SelectQueryInfo from Planner
-        bool need_aggregate = query_node->hasGroupBy() || hasAggregateFunctionNodes(query_tree);
+        const auto & expression_analysis = interpreter.getExpressionAnalysisResult();
 
         buildMetadataAndFillProjectionKeys(
             result,
             query_context,
             query,
             columns,
-            need_aggregate);
-        /// TODO: fill sample_block_for_keys or implement GROUP BY comparison in the AlterCommands.cpp
+            expression_analysis.hasAggregation());
+
+        for (const auto & key : expression_analysis.getAggregation().aggregation_keys)
+            result.sample_block_for_keys.insert({nullptr, key.type, key.name});
     }
     else
     {
@@ -169,16 +169,15 @@ ProjectionDescription ProjectionDescription::getProjectionFromAST(
         result.required_columns = select.getRequiredColumns();
         result.sample_block = select.getSampleBlock();
 
-        auto metadata = buildMetadataAndFillProjectionKeys(
+        buildMetadataAndFillProjectionKeys(
             result,
             query_context,
             query,
             columns,
             select.hasAggregation());
+
         for (const auto & key : select.getQueryAnalyzer()->aggregationKeys())
             result.sample_block_for_keys.insert({nullptr, key.type, key.name});
-
-        result.metadata = std::make_shared<StorageInMemoryMetadata>(metadata);
     }
 
     return result;
@@ -220,43 +219,12 @@ ProjectionDescription ProjectionDescription::getMinMaxCountProjection(
     result.name = MINMAX_COUNT_PROJECTION_NAME;
     result.query_ast = select_query->cloneToASTSelect();
 
-    auto external_storage_holder = std::make_shared<TemporaryTableHolder>(query_context, columns, ConstraintsDescription{});
-    StoragePtr storage = external_storage_holder->getTable();
-    if (query_context->getSettingsRef()[Setting::allow_experimental_analyzer])
+    auto fill_common_data = [&result, &partition_columns, &primary_key_asts, &minmax_columns]
+    (
+        bool has_aggregation,
+        std::ranges::range auto & aggregation_keys
+    )
     {
-        InterpreterSelectQueryAnalyzer interpreter(
-            result.query_ast,
-            query_context,
-            storage,
-            /// Here we ignore ast optimizations because otherwise aggregation keys may be removed from result header as constants.
-            SelectQueryOptions{QueryProcessingStage::WithMergeableState}
-                .modify()
-                .ignoreAlias()
-                .ignoreASTOptimizations()
-                .ignoreSettingConstraints()
-        );
-
-        result.required_columns = interpreter.getRequiredColumns();
-        result.sample_block = interpreter.getSampleBlock();
-
-        /// TODO: handle partition keys
-    }
-    else
-    {
-        InterpreterSelectQuery select(
-            result.query_ast,
-            query_context,
-            storage,
-            {},
-            /// Here we ignore ast optimizations because otherwise aggregation keys may be removed from result header as constants.
-            SelectQueryOptions{QueryProcessingStage::WithMergeableState}
-                .modify()
-                .ignoreAlias()
-                .ignoreASTOptimizations()
-                .ignoreSettingConstraints());
-        result.required_columns = select.getRequiredColumns();
-        result.sample_block = select.getSampleBlock();
-
         std::map<String, size_t> partition_column_name_to_value_index;
         if (partition_columns)
         {
@@ -264,10 +232,9 @@ ProjectionDescription ProjectionDescription::getMinMaxCountProjection(
                 partition_column_name_to_value_index[partition_columns->children[i]->getColumnNameWithoutAlias()] = i;
         }
 
-        const auto & analysis_result = select.getAnalysisResult();
-        if (analysis_result.need_aggregate)
+        if (has_aggregation)
         {
-            for (const auto & key : select.getQueryAnalyzer()->aggregationKeys())
+            for (const auto & key : aggregation_keys)
             {
                 result.sample_block_for_keys.insert({nullptr, key.type, key.name});
                 auto it = partition_column_name_to_value_index.find(key.name);
@@ -289,6 +256,50 @@ ProjectionDescription ProjectionDescription::getMinMaxCountProjection(
             ///                                                                                           size - 2
             result.primary_key_max_column_name = *(result.sample_block.getNames().cend() - 2);
         }
+    };
+
+    auto external_storage_holder = std::make_shared<TemporaryTableHolder>(query_context, columns, ConstraintsDescription{});
+    StoragePtr storage = external_storage_holder->getTable();
+    if (query_context->getSettingsRef()[Setting::allow_experimental_analyzer])
+    {
+        InterpreterSelectQueryAnalyzer interpreter(
+            result.query_ast,
+            query_context,
+            storage,
+            /// Here we ignore ast optimizations because otherwise aggregation keys may be removed from result header as constants.
+            SelectQueryOptions{QueryProcessingStage::WithMergeableState}
+                .modify()
+                .ignoreAlias()
+                .ignoreASTOptimizations()
+                .ignoreSettingConstraints()
+        );
+
+        result.required_columns = interpreter.getRequiredColumns();
+        result.sample_block = interpreter.getSampleBlock();
+
+        auto expression_analysis = interpreter.getExpressionAnalysisResult();
+
+        fill_common_data(expression_analysis.hasAggregation(), expression_analysis.getAggregation().aggregation_keys);
+    }
+    else
+    {
+        InterpreterSelectQuery select(
+            result.query_ast,
+            query_context,
+            storage,
+            {},
+            /// Here we ignore ast optimizations because otherwise aggregation keys may be removed from result header as constants.
+            SelectQueryOptions{QueryProcessingStage::WithMergeableState}
+                .modify()
+                .ignoreAlias()
+                .ignoreASTOptimizations()
+                .ignoreSettingConstraints());
+        result.required_columns = select.getRequiredColumns();
+        result.sample_block = select.getSampleBlock();
+
+        const auto & analysis_result = select.getAnalysisResult();
+
+        fill_common_data(analysis_result.need_aggregate, select.getQueryAnalyzer()->aggregationKeys());
     }
 
     result.type = ProjectionDescription::Type::Aggregate;
@@ -336,13 +347,26 @@ Block ProjectionDescription::calculate(const Block & block, ContextPtr context) 
         .ignoreSettingConstraints();
     auto query_ast_to_use = query_ast_copy ? query_ast_copy : query_ast;
 
+    TemporaryTableHolderPtr external_storage_holder;
     QueryPipelineBuilder builder;
     if (mut_context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
-        /// TODO: use block as input
+        external_storage_holder = std::make_shared<TemporaryTableHolder>(
+            mut_context,
+            [&block](const StorageID & table_id)
+            {
+                return std::make_shared<StorageValues>(
+                    table_id,
+                    ColumnsDescription::fromNamesAndTypes(block.getNamesAndTypes()),
+                    block);
+            });
+        StoragePtr storage = external_storage_holder->getTable();
+        auto fake_table = std::make_shared<TableNode>(storage, mut_context);
+
         builder = InterpreterSelectQueryAnalyzer(
             query_ast_to_use,
             mut_context,
+            fake_table,
             select_query_options)
             .buildQueryPipeline();
     }
@@ -371,7 +395,7 @@ Block ProjectionDescription::calculate(const Block & block, ContextPtr context) 
     return ret;
 }
 
-StorageInMemoryMetadata ProjectionDescription::buildMetadataAndFillProjectionKeys(
+void ProjectionDescription::buildMetadataAndFillProjectionKeys(
     ProjectionDescription & current,
     const ContextPtr & context,
     const ASTProjectionSelectQuery & projection_query,
@@ -436,7 +460,7 @@ StorageInMemoryMetadata ProjectionDescription::buildMetadataAndFillProjectionKey
     }
 
     metadata.setColumns(ColumnsDescription(block.getNamesAndTypesList()));
-    return metadata;
+    current.metadata = std::make_shared<StorageInMemoryMetadata>(metadata);
 }
 
 
